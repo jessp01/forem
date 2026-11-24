@@ -10,7 +10,7 @@ require_relative "forem_native/builder"
 # (`forem_native/{arm64-darwin,x86_64-darwin,x86_64-linux,aarch64-linux}/forem_native.{so,bundle}`),
 # and automatically compiles via `cargo` on first load if neither is staged yet.
 module ForemNative
-  LATEST_NATIVE_SYMBOL = :serialize_api_articles_json
+  LATEST_NATIVE_SYMBOL = :serialize_api_organization_json
   PROFILE_AVATAR_PALETTE_KEYS = %i[bg halo sparkle shadow body shirt trim accent cheek].freeze
   PROFILE_AVATAR_STYLE_KEYS = %i[
     backdrop outfit arm head topper eyes accessory cheeks mouth
@@ -938,6 +938,25 @@ module ForemNative
       return unless Native.respond_to?(:json_encoded_size)
 
       Native.json_encoded_size(value, escape_html_entities ? true : false)
+    end
+
+    # Single-pass validator and streaming JSON byte-size checker for
+    # `AgentSessionParsers::NormalizedDataValidator`.
+    # Returns an Array of error strings (`[]` when valid), `:needs_legacy_size` when
+    # structure and messages are valid but byte counting encountered an out-of-domain
+    # value, or `nil` when full validation should defer to Ruby.
+    def validate_agent_session_data(data, max_messages:, max_json_size:, escape_html_entities: true, check_size: true)
+      return unless Native.respond_to?(:validate_agent_session_data)
+      return unless max_messages.is_a?(Integer) && max_messages >= 0
+      return unless max_json_size.is_a?(Integer) && max_json_size >= 0
+
+      Native.validate_agent_session_data(
+        data,
+        max_messages,
+        max_json_size,
+        escape_html_entities ? true : false,
+        check_size ? true : false,
+      )
     end
 
     # Encodes plain data in one pass, byte-for-byte equal to `value.to_json` with ActiveSupport's
@@ -1919,6 +1938,193 @@ module ForemNative
         base_urls.is_a?(Array) && config.is_a?(Array)
 
       Native.serialize_api_articles_json(articles_flat, users_flat, orgs_flat, flare_tags_flat, base_urls, config)
+    end
+
+    # Formats a UTC Unix epoch timestamp with millisecond precision into
+    # `"YYYY-MM-DDTHH:MM:SS.mmmZ"`, matching ActiveSupport's `TimeWithZone#as_json`.
+    def format_utc_iso8601_millis(epoch_secs, millis)
+      return unless Native.respond_to?(:format_utc_iso8601_millis)
+      return unless valid_i64_integer?(epoch_secs) && valid_i64_integer?(millis)
+
+      Native.format_utc_iso8601_millis(epoch_secs, millis)
+    end
+
+    # Single-pass streaming JSON serializer for `/api/articles/:id` and
+    # `/api/articles/:username/:slug` (v0 & v1), including `body_html` and `body_markdown`.
+    def serialize_api_article_show_json(
+      article_flat,
+      body_html,
+      body_markdown,
+      users_flat,
+      orgs_flat,
+      flare_tags_flat,
+      base_urls,
+      config
+    )
+      return unless Native.respond_to?(:serialize_api_article_show_json)
+      return unless article_flat.is_a?(Array) && users_flat.is_a?(Array) &&
+        orgs_flat.is_a?(Array) && flare_tags_flat.is_a?(Array) &&
+        base_urls.is_a?(Array) && config.is_a?(Array)
+      return unless (body_html.nil? || body_html.is_a?(String)) &&
+        (body_markdown.nil? || body_markdown.is_a?(String))
+
+      Native.serialize_api_article_show_json(
+        article_flat, body_html, body_markdown, users_flat, orgs_flat, flare_tags_flat, base_urls, config
+      )
+    end
+
+    # Single-pass streaming JSON serializer for `/api/articles/search` (v0 & v1).
+    def serialize_api_articles_search_json(
+      articles_flat,
+      include_body_markdown,
+      single_body_markdown,
+      users_flat,
+      orgs_flat,
+      flare_tags_flat,
+      base_urls,
+      config
+    )
+      return unless Native.respond_to?(:serialize_api_articles_search_json)
+      return unless articles_flat.is_a?(Array) && users_flat.is_a?(Array) &&
+        orgs_flat.is_a?(Array) && flare_tags_flat.is_a?(Array) &&
+        base_urls.is_a?(Array) && config.is_a?(Array)
+      return unless single_body_markdown.nil? || single_body_markdown.is_a?(String)
+
+      Native.serialize_api_articles_search_json(
+        articles_flat, include_body_markdown ? true : false, single_body_markdown,
+        users_flat, orgs_flat, flare_tags_flat, base_urls, config
+      )
+    end
+
+    # Single-pass streaming JSON serializer for `/api/articles/me(/:status)` (v0 & v1).
+    def serialize_api_articles_me_json(articles_flat, user_flat, orgs_flat, flare_tags_flat, base_urls, config)
+      return unless Native.respond_to?(:serialize_api_articles_me_json)
+      return unless articles_flat.is_a?(Array) && user_flat.is_a?(Array) &&
+        orgs_flat.is_a?(Array) && flare_tags_flat.is_a?(Array) &&
+        base_urls.is_a?(Array) && config.is_a?(Array)
+
+      Native.serialize_api_articles_me_json(articles_flat, user_flat, orgs_flat, flare_tags_flat, base_urls, config)
+    end
+
+    # Selects up to 3 public reaction category indices sorted by `(-count, position)`
+    # matching `Reactable#public_reaction_categories`.
+    def select_top_public_reaction_categories(counts_flat, categories_flat)
+      return unless Native.respond_to?(:select_top_public_reaction_categories)
+      return unless counts_flat.is_a?(Array) && categories_flat.is_a?(Array)
+
+      Native.select_top_public_reaction_categories(counts_flat, categories_flat)
+    end
+
+    # Single-pass streaming JSON serializer for `/search/feed_content`
+    # (`Homepage::ArticleSerializer` / `Homepage::FetchArticles` / `Search::Article`).
+    # Accepts flat article, user, organization, flare-tag, reaction-category,
+    # reaction-count, reaction-count-lengths, and config Arrays and returns the
+    # encoded `{"result":[...]}` JSON String, or `nil` when any entry falls outside
+    # the strict fast-path domain and should fall back to Ruby.
+    def serialize_homepage_articles_json(
+      articles_flat,
+      users_flat,
+      orgs_flat,
+      flare_tags_flat,
+      reaction_categories_flat,
+      reaction_counts_flat,
+      reaction_counts_lens,
+      config
+    )
+      return unless Native.respond_to?(:serialize_homepage_articles_json)
+      return unless articles_flat.is_a?(Array) && users_flat.is_a?(Array) &&
+        orgs_flat.is_a?(Array) && flare_tags_flat.is_a?(Array) &&
+        reaction_categories_flat.is_a?(Array) && reaction_counts_flat.is_a?(Array) &&
+        reaction_counts_lens.is_a?(Array) && config.is_a?(Array)
+
+      Native.serialize_homepage_articles_json(
+        articles_flat,
+        users_flat,
+        orgs_flat,
+        flare_tags_flat,
+        reaction_categories_flat,
+        reaction_counts_flat,
+        reaction_counts_lens,
+        config,
+      )
+    end
+
+    # Formats a finite Float matching Ruby's `Float#to_s` / `ActiveSupport::JSON.encode`
+    # for `±0.0`, exact integer floats in `(-1e15, 1e15)`, and exact dyadic 1/16ths in
+    # `(-1e9, 1e9)`. Returns `nil` for non-finite, non-dyadic, or scientific-notation floats.
+    def format_json_float(value)
+      return unless Native.respond_to?(:format_json_float)
+      return unless value.is_a?(Float)
+
+      Native.format_json_float(value)
+    end
+
+    # Single-pass streaming JSON serializer for `GET /reactions?article_id=...`.
+    # Accepts `user_id` (Integer or nil), `column_names` (`Reaction.column_names`),
+    # `reaction_rows` (Array of plucked column Arrays or attribute Hashes; `"readinglist"`
+    # rows are partitioned after public reactions in place), and `article_counts`
+    # (`[{ category:, count: }, ...]`). Returns `nil` for out-of-domain inputs.
+    def serialize_article_reactions_json(user_id, column_names, reaction_rows, article_counts)
+      return unless Native.respond_to?(:serialize_article_reactions_json)
+      return unless (user_id.nil? || valid_i64_integer?(user_id)) &&
+        column_names.is_a?(Array) && reaction_rows.is_a?(Array) && article_counts.is_a?(Array)
+
+      Native.serialize_article_reactions_json(user_id, column_names, reaction_rows, article_counts)
+    end
+
+    # Single-pass streaming JSON serializer for `GET /reactions?commentable_id=...&commentable_type=...`.
+    # Accepts `user_id` (Integer or nil), `column_names` (`Reaction.column_names`),
+    # `reactions` (Array of attribute Hashes or plucked column Arrays), and `comment_rows`
+    # (Array of `[id, count]` pairs or `{ id:, count: }` Hashes). Returns `nil` for
+    # out-of-domain inputs.
+    def serialize_comment_reactions_json(user_id, column_names, reactions, comment_rows)
+      return unless Native.respond_to?(:serialize_comment_reactions_json)
+      return unless (user_id.nil? || valid_i64_integer?(user_id)) &&
+        column_names.is_a?(Array) && reactions.is_a?(Array) && comment_rows.is_a?(Array)
+
+      Native.serialize_comment_reactions_json(user_id, column_names, reactions, comment_rows)
+    end
+
+    # Formats a UTC Unix epoch timestamp (Integer seconds) as `"%b %e, %Y"` (e.g.
+    # `"Jan  5, 2026"` / `"Nov 24, 2026"`), matching English `I18n.l(time, format: :json)`.
+    # Returns `nil` for non-integers or years outside `1000..=9999`.
+    def format_joined_at_date(epoch_secs)
+      return unless Native.respond_to?(:format_joined_at_date)
+      return unless valid_i64_integer?(epoch_secs)
+
+      Native.format_joined_at_date(epoch_secs)
+    end
+
+    # Single-pass streaming JSON serializer for `Api::UsersController` (`show`, `me`, `search`).
+    # `user_fields` is a 10-element flat Array:
+    # `[id, username, name, twitter_username, github_username, summary, location,`
+    # ` website_url, created_at_sec, profile_image]`.
+    def serialize_api_user_json(user_fields, extended: false, email: nil, badge_ids: nil, followers_count: nil)
+      return unless Native.respond_to?(:serialize_api_user_json)
+      return unless user_fields.is_a?(Array) && user_fields.size == 10
+      return unless followers_count.nil? || valid_i64_integer?(followers_count)
+
+      Native.serialize_api_user_json(user_fields, extended ? true : false, email, badge_ids, followers_count)
+    end
+
+    # Single-pass streaming JSON serializer for `Api::OrganizationsController#users`.
+    # `users_flat` is a flat Array with a 10-element stride matching `serialize_api_user_json`.
+    def serialize_api_users_json(users_flat)
+      return unless Native.respond_to?(:serialize_api_users_json)
+      return unless users_flat.is_a?(Array) && (users_flat.size % 10).zero?
+
+      Native.serialize_api_users_json(users_flat)
+    end
+
+    # Single-pass streaming JSON serializer for `Api::OrganizationsController#show` (v0 & v1).
+    # `org_fields` is a 13-element flat Array:
+    # `[id, username, name, summary, twitter_username, github_username, url, location,`
+    # ` tech_stack, tag_line, story, created_at_sec, profile_image]`.
+    def serialize_api_organization_json(org_fields)
+      return unless Native.respond_to?(:serialize_api_organization_json)
+      return unless org_fields.is_a?(Array) && org_fields.size == 13
+
+      Native.serialize_api_organization_json(org_fields)
     end
 
     private

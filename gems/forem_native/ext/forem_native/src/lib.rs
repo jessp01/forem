@@ -2387,6 +2387,99 @@ fn write_json_key<W: forem_core::json::JsonOutput>(
     Some(())
 }
 
+const SMALL_INLINE_CAP: usize = 8;
+
+/// Stack-first buffer for copying `(key, value)` handles out of a Ruby `Hash` without
+/// heap-allocating a `Vec` for small hashes (<= 8 entries, e.g. message/block hashes).
+enum SmallPairs {
+    Inline {
+        buf: [(Value, Value); SMALL_INLINE_CAP],
+        len: usize,
+    },
+    Heap(Vec<(Value, Value)>),
+}
+
+impl SmallPairs {
+    fn as_slice(&self) -> &[(Value, Value)] {
+        match self {
+            Self::Inline { buf, len } => &buf[..*len],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+}
+
+/// Stack-first buffer for copying `Value` handles out of a Ruby `Array` so no `as_slice()`
+/// borrow is held across recursion or Ruby VM calls.
+enum SmallValues {
+    Inline {
+        buf: [Value; SMALL_INLINE_CAP],
+        len: usize,
+    },
+    Heap(Vec<Value>),
+}
+
+impl SmallValues {
+    fn as_slice(&self) -> &[Value] {
+        match self {
+            Self::Inline { buf, len } => &buf[..*len],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+}
+
+fn collect_hash_pairs(ruby: &Ruby, hash: RHash) -> Option<SmallPairs> {
+    let expected = hash.len();
+    if expected <= SMALL_INLINE_CAP {
+        let nil = ruby.qnil().as_value();
+        let mut pairs = SmallPairs::Inline {
+            buf: [(nil, nil); SMALL_INLINE_CAP],
+            len: 0,
+        };
+        hash.foreach(|k: Value, v: Value| {
+            match &mut pairs {
+                SmallPairs::Inline { buf, len } if *len < SMALL_INLINE_CAP => {
+                    buf[*len] = (k, v);
+                    *len += 1;
+                }
+                SmallPairs::Inline { buf, len } => {
+                    let mut vec = Vec::with_capacity(*len + 1);
+                    vec.extend_from_slice(&buf[..*len]);
+                    vec.push((k, v));
+                    pairs = SmallPairs::Heap(vec);
+                }
+                SmallPairs::Heap(vec) => vec.push((k, v)),
+            }
+            Ok(ForEach::Continue)
+        })
+        .ok()?;
+        Some(pairs)
+    } else {
+        let mut vec = Vec::with_capacity(expected);
+        hash.foreach(|k: Value, v: Value| {
+            vec.push((k, v));
+            Ok(ForEach::Continue)
+        })
+        .ok()?;
+        Some(SmallPairs::Heap(vec))
+    }
+}
+
+fn collect_array_values(ruby: &Ruby, arr: RArray) -> SmallValues {
+    // SAFETY: Copy handles into stack/heap buffer before releasing the slice borrow.
+    let slice = unsafe { arr.as_slice() };
+    if slice.len() <= SMALL_INLINE_CAP {
+        let nil = ruby.qnil().as_value();
+        let mut buf = [nil; SMALL_INLINE_CAP];
+        buf[..slice.len()].copy_from_slice(slice);
+        SmallValues::Inline {
+            buf,
+            len: slice.len(),
+        }
+    } else {
+        SmallValues::Heap(slice.to_vec())
+    }
+}
+
 /// Recursively traverses a supported Ruby value and writes or counts its JSON representation in `w`.
 fn write_json_value<W: forem_core::json::JsonOutput>(
     ruby: &Ruby,
@@ -2412,23 +2505,17 @@ fn write_json_value<W: forem_core::json::JsonOutput>(
             w.string(json_str(&RString::from_value(value)?)?);
         } else if is_instance_of(value, ruby.class_hash()) {
             let hash = RHash::from_value(value)?;
-            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(hash.len());
-            hash.foreach(|k: Value, v: Value| {
-                pairs.push((k, v));
-                Ok(ForEach::Continue)
-            })
-            .ok()?;
+            let pairs = collect_hash_pairs(ruby, hash)?;
             w.begin_object();
-            for (k, v) in pairs {
+            for &(k, v) in pairs.as_slice() {
                 write_json_key(ruby, w, k, string_keys_only)?;
                 write_json_value(ruby, w, v, string_keys_only)?;
             }
             w.end_object();
         } else if is_instance_of(value, ruby.class_array()) {
-            // SAFETY: Copy the element handles out so no slice borrow is held while recursing.
-            let items: Vec<Value> = unsafe { RArray::from_value(value)?.as_slice() }.to_vec();
+            let items = collect_array_values(ruby, RArray::from_value(value)?);
             w.begin_array();
-            for item in items {
+            for &item in items.as_slice() {
                 write_json_value(ruby, w, item, string_keys_only)?;
             }
             w.end_array();
@@ -2457,6 +2544,502 @@ fn json_encoded_size(ruby: &Ruby, value: Value, escape_html: bool) -> Option<usi
     let mut w = forem_core::json::JsonWriter::counting(escape_html);
     write_json_value(ruby, &mut w, value, true)?;
     Some(w.finish().0)
+}
+
+/// Returns `true` when `hash` has `compare_by_identity` enabled (or if the check fails).
+#[inline]
+fn hash_is_compare_by_identity(hash: RHash, id_compare_by_identity: magnus::value::Id) -> bool {
+    hash.funcall::<_, _, bool>(id_compare_by_identity, ())
+        .unwrap_or(true)
+}
+
+/// Returns `true` when `hash` has a non-nil `default` value or `default_proc`.
+/// Only called on missing-key paths so valid transcripts incur zero Ruby VM calls.
+fn hash_has_default(hash: RHash) -> Option<bool> {
+    let default_val: Value = hash.funcall("default", ()).ok()?;
+    if !default_val.is_nil() {
+        return Some(true);
+    }
+    let default_proc: Value = hash.funcall("default_proc", ()).ok()?;
+    Some(!default_proc.is_nil())
+}
+
+/// Formats simple Ruby scalar values identically to Ruby string interpolation `"#{val}"`.
+/// Returns `None` for complex types (Hash, Array, Float, custom objects, non-UTF-8 strings)
+/// so the caller defers to Ruby.
+fn format_simple_ruby_value(ruby: &Ruby, value: Value) -> Option<String> {
+    if value.is_nil() {
+        Some(String::new())
+    } else if Qtrue::from_value(value).is_some() {
+        Some("true".to_string())
+    } else if Qfalse::from_value(value).is_some() {
+        Some("false".to_string())
+    } else if let Some(integer) = Integer::from_value(value) {
+        Some(integer.to_i64().ok()?.to_string())
+    } else if let Some(symbol) = Symbol::from_value(value) {
+        Some(symbol.name().ok()?.to_string())
+    } else if is_instance_of(value, ruby.class_string()) {
+        Some(json_str(&RString::from_value(value)?)?.to_string())
+    } else {
+        None
+    }
+}
+
+/// Checks whether a Ruby hash key is a plain UTF-8 String matching one of the known keys.
+/// Returns `None` if the key is a String subclass or non-UTF-8 String (e.g. `ASCII-8BIT`)
+/// so the caller defers to Ruby.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum SessionKey {
+    Messages,
+    Metadata,
+    Role,
+    Content,
+    Type,
+    Other,
+}
+
+fn classify_utf8_key(ruby: &Ruby, key: Value) -> Option<SessionKey> {
+    if let Some(rstr) = RString::from_value(key) {
+        if !is_instance_of(key, ruby.class_string()) || !rstr.is_utf8_compatible_encoding() {
+            return None;
+        }
+        // SAFETY: Slice is only inspected within this function before returning an enum.
+        let s = std::str::from_utf8(unsafe { rstr.as_slice() }).ok()?;
+        Some(match s {
+            "messages" => SessionKey::Messages,
+            "metadata" => SessionKey::Metadata,
+            "role" => SessionKey::Role,
+            "content" => SessionKey::Content,
+            "type" => SessionKey::Type,
+            _ => SessionKey::Other,
+        })
+    } else {
+        Some(SessionKey::Other)
+    }
+}
+
+/// Validates content blocks for message `msg_index` and, when `count_size` is active,
+/// simultaneously counts their encoded JSON bytes into `w`.
+/// Returns `None` to defer the whole validation to Ruby, or `Some(size_still_supported)`.
+fn validate_and_count_content_blocks<W: forem_core::json::JsonOutput>(
+    ruby: &Ruby,
+    id_compare_by_identity: magnus::value::Id,
+    msg_index: usize,
+    content_arr: RArray,
+    errors: &mut Vec<String>,
+    w: &mut forem_core::json::JsonWriter<W>,
+    mut count_size: bool,
+) -> Option<bool> {
+    let blocks = collect_array_values(ruby, content_arr);
+    if count_size {
+        if w.depth() >= JSON_MAX_DEPTH {
+            count_size = false;
+        } else {
+            w.begin_array();
+        }
+    }
+
+    for (bi, &block_val) in blocks.as_slice().iter().enumerate() {
+        if errors.len() >= forem_core::transcript::MAX_VALIDATION_ERRORS {
+            break;
+        }
+
+        if RHash::from_value(block_val).is_none() {
+            errors.push(forem_core::transcript::format_invalid_block_type_error(
+                msg_index,
+                bi,
+                "non-object",
+            ));
+            count_size = false;
+            continue;
+        }
+        if !is_instance_of(block_val, ruby.class_hash()) {
+            return None;
+        }
+
+        let block_hash = RHash::from_value(block_val)?;
+        if hash_is_compare_by_identity(block_hash, id_compare_by_identity) {
+            return None;
+        }
+        let block_pairs = collect_hash_pairs(ruby, block_hash)?;
+
+        let mut found_type: Option<Value> = None;
+        for &(bk, bv) in block_pairs.as_slice() {
+            if classify_utf8_key(ruby, bk)? == SessionKey::Type {
+                found_type = Some(bv);
+                break;
+            }
+        }
+        let type_val = match found_type {
+            Some(v) => v,
+            None => {
+                if hash_has_default(block_hash)? {
+                    return None;
+                }
+                ruby.qnil().as_value()
+            }
+        };
+
+        let type_valid = if let Some(rstr) = RString::from_value(type_val) {
+            if !is_instance_of(type_val, ruby.class_string()) || !rstr.is_utf8_compatible_encoding()
+            {
+                return None;
+            }
+            let s = std::str::from_utf8(unsafe { rstr.as_slice() }).ok()?;
+            forem_core::transcript::is_valid_block_type(s)
+        } else {
+            false
+        };
+
+        if !type_valid {
+            let formatted = format_simple_ruby_value(ruby, type_val)?;
+            errors.push(forem_core::transcript::format_invalid_block_type_error(
+                msg_index, bi, &formatted,
+            ));
+            count_size = false;
+            continue;
+        }
+
+        if count_size {
+            if w.depth() >= JSON_MAX_DEPTH {
+                count_size = false;
+            } else {
+                w.begin_object();
+                for &(bk, bv) in block_pairs.as_slice() {
+                    if write_json_key(ruby, w, bk, true).is_none()
+                        || write_json_value(ruby, w, bv, true).is_none()
+                    {
+                        count_size = false;
+                        break;
+                    }
+                }
+                if count_size {
+                    w.end_object();
+                }
+            }
+        }
+    }
+
+    if count_size {
+        w.end_array();
+    }
+    Some(count_size)
+}
+
+/// Single-pass validator + streaming JSON byte-size counter for
+/// `AgentSessionParsers::NormalizedDataValidator`.
+///
+/// Returns:
+/// - `RArray` of error strings (`[]` when valid and within `max_json_size`),
+/// - `:needs_legacy_size` when structure and messages are valid but JSON byte-size
+///   counting encountered an out-of-domain value (Float, Time, Symbol key, invalid UTF-8, etc.),
+/// - `nil` to defer full validation to Ruby (Hash/Array subclasses, singleton classes such as
+///   RSpec stubs, hashes with `default`/`default_proc` on missing keys, or complex error values).
+fn validate_agent_session_data(
+    ruby: &Ruby,
+    data: Value,
+    max_messages: usize,
+    max_json_size: usize,
+    escape_html: bool,
+    check_size: bool,
+) -> Value {
+    // 1. Top-level Hash check.
+    if RHash::from_value(data).is_none() {
+        return ruby
+            .ary_from_vec(vec![forem_core::transcript::ERR_NON_OBJECT])
+            .as_value();
+    }
+    if !is_instance_of(data, ruby.class_hash()) {
+        return ruby.qnil().as_value();
+    }
+
+    let Some(top_hash) = RHash::from_value(data) else {
+        return ruby.qnil().as_value();
+    };
+    let id_compare_by_identity = ruby.intern("compare_by_identity?");
+    if hash_is_compare_by_identity(top_hash, id_compare_by_identity) {
+        return ruby.qnil().as_value();
+    }
+    let Some(top_pairs) = collect_hash_pairs(ruby, top_hash) else {
+        return ruby.qnil().as_value();
+    };
+
+    // 2. Structure validation (exact precedence: missing messages -> messages not array -> metadata not hash).
+    let mut messages_val: Option<Value> = None;
+    let mut metadata_val: Option<Value> = None;
+    for &(k, v) in top_pairs.as_slice() {
+        let Some(key_kind) = classify_utf8_key(ruby, k) else {
+            return ruby.qnil().as_value();
+        };
+        match key_kind {
+            SessionKey::Messages => messages_val = Some(v),
+            SessionKey::Metadata => metadata_val = Some(v),
+            _ => {}
+        }
+    }
+
+    let Some(messages_val) = messages_val else {
+        return ruby
+            .ary_from_vec(vec![forem_core::transcript::ERR_MISSING_MESSAGES])
+            .as_value();
+    };
+
+    if RArray::from_value(messages_val).is_none() {
+        return ruby
+            .ary_from_vec(vec![forem_core::transcript::ERR_MESSAGES_NOT_ARRAY])
+            .as_value();
+    }
+    if !is_instance_of(messages_val, ruby.class_array()) {
+        return ruby.qnil().as_value();
+    }
+
+    match metadata_val {
+        Some(mv) if !mv.is_nil() => {
+            if RHash::from_value(mv).is_none() {
+                return ruby
+                    .ary_from_vec(vec![forem_core::transcript::ERR_METADATA_NOT_OBJECT])
+                    .as_value();
+            }
+            if !is_instance_of(mv, ruby.class_hash()) {
+                return ruby.qnil().as_value();
+            }
+        }
+        Some(_) => {}
+        None => match hash_has_default(top_hash) {
+            Some(false) => {}
+            _ => return ruby.qnil().as_value(),
+        },
+    }
+
+    let Some(messages_arr) = RArray::from_value(messages_val) else {
+        return ruby.qnil().as_value();
+    };
+    if messages_arr.len() > max_messages {
+        return ruby
+            .ary_from_vec(vec![
+                forem_core::transcript::format_too_many_messages_error(max_messages),
+            ])
+            .as_value();
+    }
+
+    // 3. Single fused pass over top-level entries: validate messages/blocks + count JSON bytes.
+    let mut errors: Vec<String> = Vec::new();
+    let mut size_supported = check_size;
+    let mut w = forem_core::json::JsonWriter::counting(escape_html);
+    if size_supported {
+        w.begin_object();
+    }
+
+    for &(k, v) in top_pairs.as_slice() {
+        let Some(key_kind) = classify_utf8_key(ruby, k) else {
+            return ruby.qnil().as_value();
+        };
+        let is_messages_key = key_kind == SessionKey::Messages;
+
+        if size_supported && errors.is_empty() && write_json_key(ruby, &mut w, k, true).is_none() {
+            size_supported = false;
+        }
+
+        if is_messages_key {
+            let messages = collect_array_values(ruby, messages_arr);
+            if size_supported && errors.is_empty() {
+                w.begin_array();
+            }
+
+            for (i, &msg_val) in messages.as_slice().iter().enumerate() {
+                if errors.len() >= forem_core::transcript::MAX_VALIDATION_ERRORS {
+                    break;
+                }
+
+                if RHash::from_value(msg_val).is_none() {
+                    errors.push(forem_core::transcript::format_message_not_object_error(i));
+                    size_supported = false;
+                    continue;
+                }
+                if !is_instance_of(msg_val, ruby.class_hash()) {
+                    return ruby.qnil().as_value();
+                }
+
+                let Some(msg_hash) = RHash::from_value(msg_val) else {
+                    return ruby.qnil().as_value();
+                };
+                if hash_is_compare_by_identity(msg_hash, id_compare_by_identity) {
+                    return ruby.qnil().as_value();
+                }
+                let Some(msg_pairs) = collect_hash_pairs(ruby, msg_hash) else {
+                    return ruby.qnil().as_value();
+                };
+
+                let mut found_role: Option<Value> = None;
+                let mut found_content: Option<Value> = None;
+                for &(mk, mv) in msg_pairs.as_slice() {
+                    let Some(mkey) = classify_utf8_key(ruby, mk) else {
+                        return ruby.qnil().as_value();
+                    };
+                    match mkey {
+                        SessionKey::Role => found_role = Some(mv),
+                        SessionKey::Content => found_content = Some(mv),
+                        _ => {}
+                    }
+                }
+
+                let role_val = match found_role {
+                    Some(rv) => rv,
+                    None => match hash_has_default(msg_hash) {
+                        Some(false) => ruby.qnil().as_value(),
+                        _ => return ruby.qnil().as_value(),
+                    },
+                };
+
+                let role_valid = if let Some(rstr) = RString::from_value(role_val) {
+                    if !is_instance_of(role_val, ruby.class_string())
+                        || !rstr.is_utf8_compatible_encoding()
+                    {
+                        return ruby.qnil().as_value();
+                    }
+                    let Ok(s) = std::str::from_utf8(unsafe { rstr.as_slice() }) else {
+                        return ruby.qnil().as_value();
+                    };
+                    forem_core::transcript::is_valid_message_role(s)
+                } else {
+                    false
+                };
+
+                if !role_valid {
+                    let Some(formatted) = format_simple_ruby_value(ruby, role_val) else {
+                        return ruby.qnil().as_value();
+                    };
+                    errors.push(forem_core::transcript::format_invalid_role_error(
+                        i, &formatted,
+                    ));
+                    size_supported = false;
+                }
+
+                let content_val = match found_content {
+                    Some(cv) => cv,
+                    None => match hash_has_default(msg_hash) {
+                        Some(false) => ruby.qnil().as_value(),
+                        _ => return ruby.qnil().as_value(),
+                    },
+                };
+
+                if RArray::from_value(content_val).is_none() {
+                    errors.push(forem_core::transcript::format_missing_content_array_error(
+                        i,
+                    ));
+                    size_supported = false;
+                    continue;
+                }
+                if !is_instance_of(content_val, ruby.class_array()) {
+                    return ruby.qnil().as_value();
+                }
+                let Some(content_arr) = RArray::from_value(content_val) else {
+                    return ruby.qnil().as_value();
+                };
+
+                if size_supported && errors.is_empty() {
+                    if w.depth() >= JSON_MAX_DEPTH {
+                        size_supported = false;
+                        let Some(_) = validate_and_count_content_blocks(
+                            ruby,
+                            id_compare_by_identity,
+                            i,
+                            content_arr,
+                            &mut errors,
+                            &mut w,
+                            false,
+                        ) else {
+                            return ruby.qnil().as_value();
+                        };
+                    } else {
+                        w.begin_object();
+                        for &(mk, mv) in msg_pairs.as_slice() {
+                            let Some(mkey) = classify_utf8_key(ruby, mk) else {
+                                return ruby.qnil().as_value();
+                            };
+                            if size_supported
+                                && errors.is_empty()
+                                && write_json_key(ruby, &mut w, mk, true).is_none()
+                            {
+                                size_supported = false;
+                            }
+                            if mkey == SessionKey::Content {
+                                let count_now = size_supported && errors.is_empty();
+                                let Some(still_ok) = validate_and_count_content_blocks(
+                                    ruby,
+                                    id_compare_by_identity,
+                                    i,
+                                    content_arr,
+                                    &mut errors,
+                                    &mut w,
+                                    count_now,
+                                ) else {
+                                    return ruby.qnil().as_value();
+                                };
+                                if !still_ok {
+                                    size_supported = false;
+                                }
+                            } else if size_supported
+                                && errors.is_empty()
+                                && write_json_value(ruby, &mut w, mv, true).is_none()
+                            {
+                                size_supported = false;
+                            }
+                        }
+                        if size_supported && errors.is_empty() {
+                            w.end_object();
+                        }
+                    }
+                } else {
+                    let Some(_) = validate_and_count_content_blocks(
+                        ruby,
+                        id_compare_by_identity,
+                        i,
+                        content_arr,
+                        &mut errors,
+                        &mut w,
+                        false,
+                    ) else {
+                        return ruby.qnil().as_value();
+                    };
+                }
+            }
+
+            if size_supported && errors.is_empty() {
+                w.end_array();
+            }
+        } else if size_supported
+            && errors.is_empty()
+            && write_json_value(ruby, &mut w, v, true).is_none()
+        {
+            size_supported = false;
+        }
+    }
+
+    if size_supported && errors.is_empty() {
+        w.end_object();
+    }
+
+    if !errors.is_empty() {
+        return ruby.ary_from_vec(errors).as_value();
+    }
+    if !check_size {
+        return ruby.ary_new().as_value();
+    }
+    if !size_supported {
+        return ruby.sym_new("needs_legacy_size").as_value();
+    }
+
+    let json_size = w.finish().0;
+    if json_size > max_json_size {
+        ruby.ary_from_vec(vec![forem_core::transcript::format_too_large_error(
+            json_size,
+            max_json_size,
+        )])
+        .as_value()
+    } else {
+        ruby.ary_new().as_value()
+    }
 }
 
 fn truncate_feed_xml_items(ruby: &Ruby, xml: RString, max_items: usize) -> Option<RString> {
@@ -6000,6 +6583,172 @@ fn format_readable_publish_date(
     Some(ruby.str_new(&formatted))
 }
 
+fn format_utc_iso8601_millis(ruby: &Ruby, epoch_secs: i64, millis: i64) -> Option<RString> {
+    let millis_u32 = u32::try_from(millis).ok()?;
+    let formatted = forem_core::api_articles::format_utc_iso8601_millis(epoch_secs, millis_u32)?;
+    Some(ruby.str_new(&formatted))
+}
+
+unsafe fn parse_api_articles_config(
+    config_slice: &[Value],
+) -> Option<forem_core::api_articles::ApiArticlesConfig<'_>> {
+    use forem_core::api_articles::{ApiArticlesConfig, ImageOptimizerMode};
+
+    if config_slice.len() != 13 {
+        return None;
+    }
+
+    let current_year = Integer::from_value(config_slice[0])?.to_i64().ok()?;
+    let main_social_image = borrow_req_utf8_str(config_slice[1])?;
+    let cover_image_height = Integer::from_value(config_slice[2])?.to_i64().ok()?;
+    let cover_image_fit = borrow_req_utf8_str(config_slice[3])?;
+    let is_development = config_slice[4].to_bool();
+    let optimizer_mode = match Integer::from_value(config_slice[5])?.to_i64().ok()? {
+        0 => ImageOptimizerMode::Passthrough,
+        1 => ImageOptimizerMode::Cloudflare,
+        _ => return None,
+    };
+    let cloudflare_domain = borrow_opt_utf8_str(config_slice[6])?;
+    let cloudflare_directory = borrow_req_utf8_str(config_slice[7])?;
+    let ai_disclosure_labels = [
+        borrow_req_utf8_str(config_slice[8])?,
+        borrow_req_utf8_str(config_slice[9])?,
+        borrow_req_utf8_str(config_slice[10])?,
+        borrow_req_utf8_str(config_slice[11])?,
+    ];
+    let escape_html_entities = config_slice[12].to_bool();
+
+    Some(ApiArticlesConfig {
+        current_year,
+        main_social_image,
+        cover_image_height,
+        cover_image_fit,
+        is_development,
+        optimizer_mode,
+        cloudflare_domain,
+        cloudflare_directory,
+        ai_disclosure_labels,
+        escape_html_entities,
+    })
+}
+
+unsafe fn parse_api_article_users(
+    users_slice: &[Value],
+) -> Option<Vec<forem_core::api_articles::ApiArticleUser<'_>>> {
+    if users_slice.len() % 8 != 0 {
+        return None;
+    }
+    let mut users = Vec::with_capacity(users_slice.len() / 8);
+    for chunk in users_slice.chunks_exact(8) {
+        let id = Integer::from_value(chunk[0])?.to_i64().ok()?;
+        users.push(forem_core::api_articles::ApiArticleUser {
+            id,
+            name: borrow_opt_utf8_str(chunk[1])?,
+            username: borrow_opt_utf8_str(chunk[2])?,
+            twitter_username: borrow_opt_utf8_str(chunk[3])?,
+            github_username: borrow_opt_utf8_str(chunk[4])?,
+            website_url: borrow_opt_utf8_str(chunk[5])?,
+            profile_image: borrow_opt_utf8_str(chunk[6])?,
+            profile_image_90: borrow_opt_utf8_str(chunk[7])?,
+        });
+    }
+    Some(users)
+}
+
+unsafe fn parse_api_article_orgs(
+    orgs_slice: &[Value],
+) -> Option<Vec<forem_core::api_articles::ApiArticleOrganization<'_>>> {
+    if orgs_slice.len() % 5 != 0 {
+        return None;
+    }
+    let mut orgs = Vec::with_capacity(orgs_slice.len() / 5);
+    for chunk in orgs_slice.chunks_exact(5) {
+        orgs.push(forem_core::api_articles::ApiArticleOrganization {
+            name: borrow_opt_utf8_str(chunk[0])?,
+            username: borrow_opt_utf8_str(chunk[1])?,
+            slug: borrow_opt_utf8_str(chunk[2])?,
+            profile_image: borrow_opt_utf8_str(chunk[3])?,
+            profile_image_90: borrow_opt_utf8_str(chunk[4])?,
+        });
+    }
+    Some(orgs)
+}
+
+unsafe fn parse_api_article_flare_tags(
+    flare_tags_slice: &[Value],
+) -> Option<Vec<forem_core::api_articles::ApiArticleFlareTag<'_>>> {
+    if flare_tags_slice.len() % 4 != 0 {
+        return None;
+    }
+    let mut flare_tags = Vec::with_capacity(flare_tags_slice.len() / 4);
+    for chunk in flare_tags_slice.chunks_exact(4) {
+        flare_tags.push(forem_core::api_articles::ApiArticleFlareTag {
+            match_name: borrow_req_utf8_str(chunk[0])?,
+            name: borrow_opt_utf8_str(chunk[1])?,
+            bg_color_hex: borrow_opt_utf8_str(chunk[2])?,
+            text_color_hex: borrow_opt_utf8_str(chunk[3])?,
+        });
+    }
+    Some(flare_tags)
+}
+
+unsafe fn parse_api_article_base_urls(base_urls_slice: &[Value]) -> Option<Vec<&str>> {
+    let mut base_urls = Vec::with_capacity(base_urls_slice.len());
+    for &val in base_urls_slice {
+        base_urls.push(borrow_req_utf8_str(val)?);
+    }
+    Some(base_urls)
+}
+
+unsafe fn parse_api_article_rows(
+    articles_slice: &[Value],
+) -> Option<Vec<forem_core::api_articles::ApiArticleRow<'_>>> {
+    if articles_slice.len() % 28 != 0 {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(articles_slice.len() / 28);
+    for chunk in articles_slice.chunks_exact(28) {
+        let id = Integer::from_value(chunk[0])?.to_i64().ok()?;
+        let user_idx = Integer::from_value(chunk[1])?.to_i64().ok()?;
+        let org_idx = Integer::from_value(chunk[2])?.to_i64().ok()?;
+        let base_url_idx = Integer::from_value(chunk[3])?.to_i64().ok()?;
+        let ai_raw = Integer::from_value(chunk[21])?.to_i64().ok()?;
+        let ai_disclosure_idx = u8::try_from(ai_raw).ok()?;
+
+        rows.push(forem_core::api_articles::ApiArticleRow {
+            id,
+            user_idx,
+            org_idx,
+            base_url_idx,
+            url_path: borrow_opt_utf8_str(chunk[4])?,
+            collection_id: extract_optional_i64(chunk[5])?,
+            title: borrow_opt_utf8_str(chunk[6])?,
+            description: borrow_opt_utf8_str(chunk[7])?,
+            main_image: borrow_opt_utf8_str(chunk[8])?,
+            social_image: borrow_opt_utf8_str(chunk[9])?,
+            video_thumbnail_url: borrow_opt_utf8_str(chunk[10])?,
+            cached_tag_list: borrow_opt_utf8_str(chunk[11])?,
+            slug: borrow_opt_utf8_str(chunk[12])?,
+            path: borrow_opt_utf8_str(chunk[13])?,
+            canonical_url: borrow_opt_utf8_str(chunk[14])?,
+            comments_count: extract_optional_i64(chunk[15])?,
+            public_reactions_count: extract_optional_i64(chunk[16])?,
+            reading_time: extract_optional_i64(chunk[17])?,
+            subforem_id: extract_optional_i64(chunk[18])?,
+            language: borrow_opt_utf8_str(chunk[19])?,
+            published: chunk[20].to_bool(),
+            ai_disclosure_idx,
+            created_at_sec: extract_optional_i64(chunk[22])?,
+            edited_at_sec: extract_optional_i64(chunk[23])?,
+            crossposted_at_sec: extract_optional_i64(chunk[24])?,
+            published_at_sec: extract_optional_i64(chunk[25])?,
+            last_comment_at_sec: extract_optional_i64(chunk[26])?,
+            social_image_large: chunk[27].to_bool(),
+        });
+    }
+    Some(rows)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serialize_api_articles_json(
     ruby: &Ruby,
@@ -6010,145 +6759,16 @@ fn serialize_api_articles_json(
     base_urls_arr: RArray,
     config_arr: RArray,
 ) -> Option<RString> {
-    use forem_core::api_articles::{
-        ApiArticleFlareTag, ApiArticleOrganization, ApiArticleRow, ApiArticleUser,
-        ApiArticlesConfig, ImageOptimizerMode,
-    };
-
     let json = {
         // SAFETY: No Ruby VM calls or allocations happen inside this block while
         // borrowed `RArray` / `RString` slices are live.
         unsafe {
-            let articles_slice = articles_flat.as_slice();
-            let users_slice = users_flat.as_slice();
-            let orgs_slice = orgs_flat.as_slice();
-            let flare_tags_slice = flare_tags_flat.as_slice();
-            let base_urls_slice = base_urls_arr.as_slice();
-            let config_slice = config_arr.as_slice();
-
-            if articles_slice.len() % 28 != 0
-                || users_slice.len() % 8 != 0
-                || orgs_slice.len() % 5 != 0
-                || flare_tags_slice.len() % 4 != 0
-                || config_slice.len() != 13
-            {
-                return None;
-            }
-
-            let current_year = Integer::from_value(config_slice[0])?.to_i64().ok()?;
-            let main_social_image = borrow_req_utf8_str(config_slice[1])?;
-            let cover_image_height = Integer::from_value(config_slice[2])?.to_i64().ok()?;
-            let cover_image_fit = borrow_req_utf8_str(config_slice[3])?;
-            let is_development = config_slice[4].to_bool();
-            let optimizer_mode = match Integer::from_value(config_slice[5])?.to_i64().ok()? {
-                0 => ImageOptimizerMode::Passthrough,
-                1 => ImageOptimizerMode::Cloudflare,
-                _ => return None,
-            };
-            let cloudflare_domain = borrow_opt_utf8_str(config_slice[6])?;
-            let cloudflare_directory = borrow_req_utf8_str(config_slice[7])?;
-            let ai_disclosure_labels = [
-                borrow_req_utf8_str(config_slice[8])?,
-                borrow_req_utf8_str(config_slice[9])?,
-                borrow_req_utf8_str(config_slice[10])?,
-                borrow_req_utf8_str(config_slice[11])?,
-            ];
-            let escape_html_entities = config_slice[12].to_bool();
-
-            let config = ApiArticlesConfig {
-                current_year,
-                main_social_image,
-                cover_image_height,
-                cover_image_fit,
-                is_development,
-                optimizer_mode,
-                cloudflare_domain,
-                cloudflare_directory,
-                ai_disclosure_labels,
-                escape_html_entities,
-            };
-
-            let mut base_urls = Vec::with_capacity(base_urls_slice.len());
-            for &val in base_urls_slice {
-                base_urls.push(borrow_req_utf8_str(val)?);
-            }
-
-            let mut users = Vec::with_capacity(users_slice.len() / 8);
-            for chunk in users_slice.chunks_exact(8) {
-                let id = Integer::from_value(chunk[0])?.to_i64().ok()?;
-                users.push(ApiArticleUser {
-                    id,
-                    name: borrow_opt_utf8_str(chunk[1])?,
-                    username: borrow_opt_utf8_str(chunk[2])?,
-                    twitter_username: borrow_opt_utf8_str(chunk[3])?,
-                    github_username: borrow_opt_utf8_str(chunk[4])?,
-                    website_url: borrow_opt_utf8_str(chunk[5])?,
-                    profile_image: borrow_opt_utf8_str(chunk[6])?,
-                    profile_image_90: borrow_opt_utf8_str(chunk[7])?,
-                });
-            }
-
-            let mut orgs = Vec::with_capacity(orgs_slice.len() / 5);
-            for chunk in orgs_slice.chunks_exact(5) {
-                orgs.push(ApiArticleOrganization {
-                    name: borrow_opt_utf8_str(chunk[0])?,
-                    username: borrow_opt_utf8_str(chunk[1])?,
-                    slug: borrow_opt_utf8_str(chunk[2])?,
-                    profile_image: borrow_opt_utf8_str(chunk[3])?,
-                    profile_image_90: borrow_opt_utf8_str(chunk[4])?,
-                });
-            }
-
-            let mut flare_tags = Vec::with_capacity(flare_tags_slice.len() / 4);
-            for chunk in flare_tags_slice.chunks_exact(4) {
-                flare_tags.push(ApiArticleFlareTag {
-                    match_name: borrow_req_utf8_str(chunk[0])?,
-                    name: borrow_opt_utf8_str(chunk[1])?,
-                    bg_color_hex: borrow_opt_utf8_str(chunk[2])?,
-                    text_color_hex: borrow_opt_utf8_str(chunk[3])?,
-                });
-            }
-
-            let mut rows = Vec::with_capacity(articles_slice.len() / 28);
-            for chunk in articles_slice.chunks_exact(28) {
-                let id = Integer::from_value(chunk[0])?.to_i64().ok()?;
-                let user_idx = Integer::from_value(chunk[1])?.to_i64().ok()?;
-                let org_idx = Integer::from_value(chunk[2])?.to_i64().ok()?;
-                let base_url_idx = Integer::from_value(chunk[3])?.to_i64().ok()?;
-                let ai_raw = Integer::from_value(chunk[21])?.to_i64().ok()?;
-                let ai_disclosure_idx = u8::try_from(ai_raw).ok()?;
-
-                rows.push(ApiArticleRow {
-                    id,
-                    user_idx,
-                    org_idx,
-                    base_url_idx,
-                    url_path: borrow_opt_utf8_str(chunk[4])?,
-                    collection_id: extract_optional_i64(chunk[5])?,
-                    title: borrow_opt_utf8_str(chunk[6])?,
-                    description: borrow_opt_utf8_str(chunk[7])?,
-                    main_image: borrow_opt_utf8_str(chunk[8])?,
-                    social_image: borrow_opt_utf8_str(chunk[9])?,
-                    video_thumbnail_url: borrow_opt_utf8_str(chunk[10])?,
-                    cached_tag_list: borrow_opt_utf8_str(chunk[11])?,
-                    slug: borrow_opt_utf8_str(chunk[12])?,
-                    path: borrow_opt_utf8_str(chunk[13])?,
-                    canonical_url: borrow_opt_utf8_str(chunk[14])?,
-                    comments_count: extract_optional_i64(chunk[15])?,
-                    public_reactions_count: extract_optional_i64(chunk[16])?,
-                    reading_time: extract_optional_i64(chunk[17])?,
-                    subforem_id: extract_optional_i64(chunk[18])?,
-                    language: borrow_opt_utf8_str(chunk[19])?,
-                    published: chunk[20].to_bool(),
-                    ai_disclosure_idx,
-                    created_at_sec: extract_optional_i64(chunk[22])?,
-                    edited_at_sec: extract_optional_i64(chunk[23])?,
-                    crossposted_at_sec: extract_optional_i64(chunk[24])?,
-                    published_at_sec: extract_optional_i64(chunk[25])?,
-                    last_comment_at_sec: extract_optional_i64(chunk[26])?,
-                    social_image_large: chunk[27].to_bool(),
-                });
-            }
+            let config = parse_api_articles_config(config_arr.as_slice())?;
+            let base_urls = parse_api_article_base_urls(base_urls_arr.as_slice())?;
+            let users = parse_api_article_users(users_flat.as_slice())?;
+            let orgs = parse_api_article_orgs(orgs_flat.as_slice())?;
+            let flare_tags = parse_api_article_flare_tags(flare_tags_flat.as_slice())?;
+            let rows = parse_api_article_rows(articles_flat.as_slice())?;
 
             forem_core::api_articles::serialize_api_articles_json(
                 &rows,
@@ -6161,6 +6781,736 @@ fn serialize_api_articles_json(
         }
     }?;
 
+    Some(ruby.str_new(&json))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_api_article_show_json(
+    ruby: &Ruby,
+    article_flat: RArray,
+    body_html: Value,
+    body_markdown: Value,
+    users_flat: RArray,
+    orgs_flat: RArray,
+    flare_tags_flat: RArray,
+    base_urls_arr: RArray,
+    config_arr: RArray,
+) -> Option<RString> {
+    let json = {
+        // SAFETY: No Ruby VM calls or allocations happen inside this block while
+        // borrowed `RArray` / `RString` slices are live.
+        unsafe {
+            let config = parse_api_articles_config(config_arr.as_slice())?;
+            let base_urls = parse_api_article_base_urls(base_urls_arr.as_slice())?;
+            let users = parse_api_article_users(users_flat.as_slice())?;
+            let orgs = parse_api_article_orgs(orgs_flat.as_slice())?;
+            let flare_tags = parse_api_article_flare_tags(flare_tags_flat.as_slice())?;
+            let rows = parse_api_article_rows(article_flat.as_slice())?;
+            if rows.len() != 1 {
+                return None;
+            }
+            let body_html_str = borrow_opt_utf8_str(body_html)?;
+            let body_markdown_str = borrow_opt_utf8_str(body_markdown)?;
+
+            forem_core::api_articles::serialize_api_article_show_json(
+                &rows[0],
+                body_html_str,
+                body_markdown_str,
+                &users,
+                &orgs,
+                &flare_tags,
+                &base_urls,
+                &config,
+            )
+        }
+    }?;
+
+    Some(ruby.str_new(&json))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_api_articles_search_json(
+    ruby: &Ruby,
+    articles_flat: RArray,
+    include_body_markdown: bool,
+    single_body_markdown: Value,
+    users_flat: RArray,
+    orgs_flat: RArray,
+    flare_tags_flat: RArray,
+    base_urls_arr: RArray,
+    config_arr: RArray,
+) -> Option<RString> {
+    let json = {
+        // SAFETY: No Ruby VM calls or allocations happen inside this block while
+        // borrowed `RArray` / `RString` slices are live.
+        unsafe {
+            let config = parse_api_articles_config(config_arr.as_slice())?;
+            let base_urls = parse_api_article_base_urls(base_urls_arr.as_slice())?;
+            let users = parse_api_article_users(users_flat.as_slice())?;
+            let orgs = parse_api_article_orgs(orgs_flat.as_slice())?;
+            let flare_tags = parse_api_article_flare_tags(flare_tags_flat.as_slice())?;
+            let rows = parse_api_article_rows(articles_flat.as_slice())?;
+            let single_md = if include_body_markdown {
+                Some(borrow_opt_utf8_str(single_body_markdown)?)
+            } else {
+                None
+            };
+
+            forem_core::api_articles::serialize_api_articles_search_json(
+                &rows,
+                single_md,
+                &users,
+                &orgs,
+                &flare_tags,
+                &base_urls,
+                &config,
+            )
+        }
+    }?;
+
+    Some(ruby.str_new(&json))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_api_articles_me_json(
+    ruby: &Ruby,
+    articles_flat: RArray,
+    user_flat: RArray,
+    orgs_flat: RArray,
+    flare_tags_flat: RArray,
+    base_urls_arr: RArray,
+    config_arr: RArray,
+) -> Option<RString> {
+    let json = {
+        // SAFETY: No Ruby VM calls or allocations happen inside this block while
+        // borrowed `RArray` / `RString` slices are live.
+        unsafe {
+            let articles_slice = articles_flat.as_slice();
+            if articles_slice.len() % 20 != 0 {
+                return None;
+            }
+            let config = parse_api_articles_config(config_arr.as_slice())?;
+            let base_urls = parse_api_article_base_urls(base_urls_arr.as_slice())?;
+            let users = parse_api_article_users(user_flat.as_slice())?;
+            if users.len() != 1 {
+                return None;
+            }
+            let orgs = parse_api_article_orgs(orgs_flat.as_slice())?;
+            let flare_tags = parse_api_article_flare_tags(flare_tags_flat.as_slice())?;
+
+            let mut rows = Vec::with_capacity(articles_slice.len() / 20);
+            for chunk in articles_slice.chunks_exact(20) {
+                let id = Integer::from_value(chunk[0])?.to_i64().ok()?;
+                let org_idx = Integer::from_value(chunk[1])?.to_i64().ok()?;
+                let base_url_idx = Integer::from_value(chunk[2])?.to_i64().ok()?;
+                let published = if chunk[6].is_nil() {
+                    None
+                } else {
+                    Some(chunk[6].to_bool())
+                };
+                let published_at_millis = match extract_optional_i64(chunk[8])? {
+                    Some(m) => Some(u32::try_from(m).ok()?),
+                    None => None,
+                };
+
+                rows.push(forem_core::api_articles::ApiArticleMeRow {
+                    id,
+                    org_idx,
+                    base_url_idx,
+                    url_path: borrow_opt_utf8_str(chunk[3])?,
+                    title: borrow_opt_utf8_str(chunk[4])?,
+                    description: borrow_opt_utf8_str(chunk[5])?,
+                    published,
+                    published_at_sec: extract_optional_i64(chunk[7])?,
+                    published_at_millis,
+                    crossposted_at_sec: extract_optional_i64(chunk[9])?,
+                    slug: borrow_opt_utf8_str(chunk[10])?,
+                    path: borrow_opt_utf8_str(chunk[11])?,
+                    comments_count: extract_optional_i64(chunk[12])?,
+                    public_reactions_count: extract_optional_i64(chunk[13])?,
+                    page_views_count: extract_optional_i64(chunk[14])?,
+                    body_markdown: borrow_opt_utf8_str(chunk[15])?,
+                    main_image: borrow_opt_utf8_str(chunk[16])?,
+                    cached_tag_list: borrow_opt_utf8_str(chunk[17])?,
+                    canonical_url: borrow_opt_utf8_str(chunk[18])?,
+                    reading_time: extract_optional_i64(chunk[19])?,
+                });
+            }
+
+            forem_core::api_articles::serialize_api_articles_me_json(
+                &rows,
+                &users[0],
+                &orgs,
+                &flare_tags,
+                &base_urls,
+                &config,
+            )
+        }
+    }?;
+
+    Some(ruby.str_new(&json))
+}
+
+unsafe fn parse_public_reaction_categories(
+    cats_slice: &[Value],
+) -> Option<Vec<forem_core::homepage_articles::PublicReactionCategory<'_>>> {
+    if cats_slice.len() % 4 != 0 {
+        return None;
+    }
+    let mut categories = Vec::with_capacity(cats_slice.len() / 4);
+    for chunk in cats_slice.chunks_exact(4) {
+        categories.push(forem_core::homepage_articles::PublicReactionCategory {
+            slug: borrow_req_utf8_str(chunk[0])?,
+            name: borrow_opt_utf8_str(chunk[1])?,
+            icon: borrow_opt_utf8_str(chunk[2])?,
+            position: Integer::from_value(chunk[3])?.to_i64().ok()?,
+        });
+    }
+    Some(categories)
+}
+
+unsafe fn parse_reaction_counts(counts_slice: &[Value]) -> Option<Vec<(&str, i64)>> {
+    if counts_slice.len() % 2 != 0 {
+        return None;
+    }
+    let mut counts = Vec::with_capacity(counts_slice.len() / 2);
+    for chunk in counts_slice.chunks_exact(2) {
+        counts.push((
+            borrow_req_utf8_str(chunk[0])?,
+            Integer::from_value(chunk[1])?.to_i64().ok()?,
+        ));
+    }
+    Some(counts)
+}
+
+fn select_top_public_reaction_categories(
+    ruby: &Ruby,
+    counts_flat: RArray,
+    categories_flat: RArray,
+) -> Option<RArray> {
+    let (indices, len) = {
+        // SAFETY: No Ruby VM calls or allocations happen inside this block while
+        // borrowed `RArray` / `RString` slices are live.
+        unsafe {
+            let categories = parse_public_reaction_categories(categories_flat.as_slice())?;
+            let counts = parse_reaction_counts(counts_flat.as_slice())?;
+            forem_core::homepage_articles::select_top_public_reaction_categories(
+                &counts,
+                &categories,
+            )
+        }
+    };
+
+    let out = ruby.ary_new_capa(len);
+    for &idx in &indices[..len] {
+        out.push(idx as i64).ok()?;
+    }
+    Some(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_homepage_articles_json(
+    ruby: &Ruby,
+    articles_flat: RArray,
+    users_flat: RArray,
+    orgs_flat: RArray,
+    flare_tags_flat: RArray,
+    reaction_categories_flat: RArray,
+    reaction_counts_flat: RArray,
+    reaction_counts_lens_arr: RArray,
+    config_arr: RArray,
+) -> Option<RString> {
+    use forem_core::api_articles::ImageOptimizerMode;
+    use forem_core::homepage_articles::{
+        HomepageArticleFlareTag, HomepageArticleOrganization, HomepageArticleRow,
+        HomepageArticleUser, HomepageArticlesConfig,
+    };
+
+    let json = {
+        // SAFETY: No Ruby VM calls or allocations happen inside this block while
+        // borrowed `RArray` / `RString` slices are live.
+        unsafe {
+            let articles_slice = articles_flat.as_slice();
+            let users_slice = users_flat.as_slice();
+            let orgs_slice = orgs_flat.as_slice();
+            let flare_tags_slice = flare_tags_flat.as_slice();
+            let reaction_cats_slice = reaction_categories_flat.as_slice();
+            let reaction_counts_slice = reaction_counts_flat.as_slice();
+            let reaction_lens_slice = reaction_counts_lens_arr.as_slice();
+            let config_slice = config_arr.as_slice();
+
+            if articles_slice.len() % 16 != 0
+                || users_slice.len() % 3 != 0
+                || orgs_slice.len() % 3 != 0
+                || flare_tags_slice.len() % 4 != 0
+                || reaction_cats_slice.len() % 4 != 0
+                || reaction_counts_slice.len() % 2 != 0
+                || config_slice.len() != 5
+            {
+                return None;
+            }
+
+            let current_year = Integer::from_value(config_slice[0])?.to_i64().ok()?;
+            let optimizer_mode = match Integer::from_value(config_slice[1])?.to_i64().ok()? {
+                0 => ImageOptimizerMode::Passthrough,
+                1 => ImageOptimizerMode::Cloudflare,
+                _ => return None,
+            };
+            let cloudflare_domain = borrow_opt_utf8_str(config_slice[2])?;
+            let cloudflare_directory = borrow_req_utf8_str(config_slice[3])?;
+            let escape_html_entities = config_slice[4].to_bool();
+
+            let config = HomepageArticlesConfig {
+                current_year,
+                optimizer_mode,
+                cloudflare_domain,
+                cloudflare_directory,
+                escape_html_entities,
+            };
+
+            let mut users = Vec::with_capacity(users_slice.len() / 3);
+            for chunk in users_slice.chunks_exact(3) {
+                users.push(HomepageArticleUser {
+                    name: borrow_opt_utf8_str(chunk[0])?,
+                    profile_image_90: borrow_opt_utf8_str(chunk[1])?,
+                    username: borrow_opt_utf8_str(chunk[2])?,
+                });
+            }
+
+            let mut orgs = Vec::with_capacity(orgs_slice.len() / 3);
+            for chunk in orgs_slice.chunks_exact(3) {
+                orgs.push(HomepageArticleOrganization {
+                    name: borrow_opt_utf8_str(chunk[0])?,
+                    profile_image_90: borrow_opt_utf8_str(chunk[1])?,
+                    slug: borrow_opt_utf8_str(chunk[2])?,
+                });
+            }
+
+            let mut flare_tags = Vec::with_capacity(flare_tags_slice.len() / 4);
+            for chunk in flare_tags_slice.chunks_exact(4) {
+                flare_tags.push(HomepageArticleFlareTag {
+                    match_name: borrow_req_utf8_str(chunk[0])?,
+                    name: borrow_opt_utf8_str(chunk[1])?,
+                    bg_color_hex: borrow_opt_utf8_str(chunk[2])?,
+                    text_color_hex: borrow_opt_utf8_str(chunk[3])?,
+                });
+            }
+
+            let reaction_categories = parse_public_reaction_categories(reaction_cats_slice)?;
+            let reaction_counts = parse_reaction_counts(reaction_counts_slice)?;
+
+            let mut reaction_lens = Vec::with_capacity(reaction_lens_slice.len());
+            for &val in reaction_lens_slice {
+                let n = Integer::from_value(val)?.to_i64().ok()?;
+                reaction_lens.push(usize::try_from(n).ok()?);
+            }
+
+            let mut rows = Vec::with_capacity(articles_slice.len() / 16);
+            for chunk in articles_slice.chunks_exact(16) {
+                rows.push(HomepageArticleRow {
+                    id: Integer::from_value(chunk[0])?.to_i64().ok()?,
+                    user_idx: Integer::from_value(chunk[1])?.to_i64().ok()?,
+                    org_idx: Integer::from_value(chunk[2])?.to_i64().ok()?,
+                    favorited_by_user_id: extract_optional_i64(chunk[3])?,
+                    path: borrow_opt_utf8_str(chunk[4])?,
+                    public_reactions_count: extract_optional_i64(chunk[5])?,
+                    reading_time: extract_optional_i64(chunk[6])?,
+                    title: borrow_opt_utf8_str(chunk[7])?,
+                    user_id: extract_optional_i64(chunk[8])?,
+                    comments_count: extract_optional_i64(chunk[9])?,
+                    displayed_comments_count: extract_optional_i64(chunk[10])?,
+                    video_duration_in_seconds: extract_optional_i64(chunk[11])?,
+                    video_thumbnail_url: borrow_opt_utf8_str(chunk[12])?,
+                    cached_tag_list: borrow_opt_utf8_str(chunk[13])?,
+                    published_at_sec: extract_optional_i64(chunk[14])?,
+                    crossposted_at_sec: extract_optional_i64(chunk[15])?,
+                });
+            }
+
+            forem_core::homepage_articles::serialize_homepage_articles_json(
+                &rows,
+                &users,
+                &orgs,
+                &flare_tags,
+                &reaction_categories,
+                &reaction_counts,
+                &reaction_lens,
+                &config,
+            )
+        }
+    }?;
+
+    Some(ruby.str_new(&json))
+}
+
+enum OwnedReactionField {
+    Null,
+    Int(i64),
+    Float(f64),
+    Str(String),
+    UtcMillis { secs: i64, millis: u32 },
+    Bool(bool),
+}
+
+impl OwnedReactionField {
+    fn as_borrowed(&self) -> forem_core::reactions::ReactionFieldValue<'_> {
+        match self {
+            Self::Null => forem_core::reactions::ReactionFieldValue::Null,
+            Self::Int(n) => forem_core::reactions::ReactionFieldValue::Int(*n),
+            Self::Float(f) => forem_core::reactions::ReactionFieldValue::Float(*f),
+            Self::Str(s) => forem_core::reactions::ReactionFieldValue::Str(s.as_str()),
+            Self::UtcMillis { secs, millis } => {
+                forem_core::reactions::ReactionFieldValue::UtcMillis {
+                    secs: *secs,
+                    millis: *millis,
+                }
+            }
+            Self::Bool(b) => forem_core::reactions::ReactionFieldValue::Bool(*b),
+        }
+    }
+}
+
+fn extract_plain_utf8_string(ruby: &Ruby, val: Value) -> Option<String> {
+    let rstr = RString::from_value(val)?;
+    if !is_instance_of(val, ruby.class_string()) || !rstr.is_utf8_compatible_encoding() {
+        return None;
+    }
+    let slice = unsafe { rstr.as_slice() };
+    std::str::from_utf8(slice).ok().map(str::to_owned)
+}
+
+fn extract_optional_user_id(val: Value) -> Option<Option<i64>> {
+    if val.is_nil() {
+        return Some(None);
+    }
+    let int = Integer::from_value(val)?;
+    int.to_i64().ok().map(Some)
+}
+
+fn extract_reaction_field(ruby: &Ruby, val: Value) -> Option<OwnedReactionField> {
+    if val.is_nil() {
+        return Some(OwnedReactionField::Null);
+    }
+    if Qtrue::from_value(val).is_some() {
+        return Some(OwnedReactionField::Bool(true));
+    }
+    if Qfalse::from_value(val).is_some() {
+        return Some(OwnedReactionField::Bool(false));
+    }
+    if let Some(int) = Integer::from_value(val) {
+        return int.to_i64().ok().map(OwnedReactionField::Int);
+    }
+    if let Some(fl) = Float::from_value(val) {
+        return Some(OwnedReactionField::Float(fl.to_f64()));
+    }
+    if RString::from_value(val).is_some() {
+        return extract_plain_utf8_string(ruby, val).map(OwnedReactionField::Str);
+    }
+    if val.respond_to("tv_sec", false).unwrap_or(false) {
+        let is_utc: bool = val.funcall("utc?", ()).ok()?;
+        let utc_offset: i64 = val.funcall("utc_offset", ()).ok()?;
+        if !is_utc || utc_offset != 0 {
+            return None;
+        }
+        let secs: i64 = val.funcall("tv_sec", ()).ok()?;
+        let nsec: i64 = val.funcall("tv_nsec", ()).ok()?;
+        if !(0..1_000_000_000).contains(&nsec) {
+            return None;
+        }
+        return Some(OwnedReactionField::UtcMillis {
+            secs,
+            millis: (nsec / 1_000_000) as u32,
+        });
+    }
+    None
+}
+
+fn extract_column_names(ruby: &Ruby, column_names: RArray) -> Option<Vec<String>> {
+    let len = column_names.len();
+    let mut cols = Vec::with_capacity(len);
+    for idx in 0..len {
+        let val: Value = column_names.entry(idx as isize).ok()?;
+        cols.push(extract_plain_utf8_string(ruby, val)?);
+    }
+    Some(cols)
+}
+
+fn extract_reaction_rows(
+    ruby: &Ruby,
+    column_names: RArray,
+    rows: RArray,
+) -> Option<Vec<OwnedReactionField>> {
+    let width = column_names.len();
+    let row_count = rows.len();
+    if width == 0 && row_count > 0 {
+        return None;
+    }
+    let total_cells = row_count.checked_mul(width)?;
+    let mut out = Vec::with_capacity(total_cells);
+
+    for row_idx in 0..row_count {
+        // Read each row and cell from the live Ruby Array at point of use so `GC.compact`
+        // never leaves stale handles on the Rust heap across Ruby method calls.
+        let row_val: Value = rows.entry(row_idx as isize).ok()?;
+        if let Some(row_arr) = RArray::from_value(row_val) {
+            if row_arr.len() != width {
+                return None;
+            }
+            for col_idx in 0..width {
+                let cell: Value = row_arr.entry(col_idx as isize).ok()?;
+                out.push(extract_reaction_field(ruby, cell)?);
+            }
+        } else {
+            let row_hash = RHash::from_value(row_val)?;
+            if row_hash.len() != width {
+                return None;
+            }
+            for col_idx in 0..width {
+                let key: Value = column_names.entry(col_idx as isize).ok()?;
+                let cell = row_hash.get(key)?;
+                out.push(extract_reaction_field(ruby, cell)?);
+            }
+        }
+    }
+
+    Some(out)
+}
+
+fn format_json_float(ruby: &Ruby, value: f64) -> Option<RString> {
+    let formatted = forem_core::reactions::format_json_float(value)?;
+    Some(ruby.str_new(&formatted))
+}
+
+fn serialize_article_reactions_json(
+    ruby: &Ruby,
+    user_id: Value,
+    column_names: RArray,
+    reaction_rows: RArray,
+    article_counts: RArray,
+) -> Option<RString> {
+    let uid = extract_optional_user_id(user_id)?;
+    let cols = extract_column_names(ruby, column_names)?;
+    let owned_fields = extract_reaction_rows(ruby, column_names, reaction_rows)?;
+
+    let count_len = article_counts.len();
+    let sym_category = ruby.to_symbol("category");
+    let sym_count = ruby.to_symbol("count");
+
+    let mut owned_counts: Vec<(String, i64)> = Vec::with_capacity(count_len);
+    for idx in 0..count_len {
+        let entry_val: Value = article_counts.entry(idx as isize).ok()?;
+        if let Some(hash) = RHash::from_value(entry_val) {
+            if hash.len() != 2 {
+                return None;
+            }
+            let cat_val = hash
+                .get(sym_category)
+                .or_else(|| hash.get(ruby.str_new("category")))?;
+            let category = extract_plain_utf8_string(ruby, cat_val)?;
+            let cnt_val = hash
+                .get(sym_count)
+                .or_else(|| hash.get(ruby.str_new("count")))?;
+            let count = Integer::from_value(cnt_val)?.to_i64().ok()?;
+            owned_counts.push((category, count));
+        } else {
+            let arr = RArray::from_value(entry_val)?;
+            if arr.len() != 2 {
+                return None;
+            }
+            let cat_val: Value = arr.entry(0).ok()?;
+            let cnt_val: Value = arr.entry(1).ok()?;
+            let category = extract_plain_utf8_string(ruby, cat_val)?;
+            let count = Integer::from_value(cnt_val)?.to_i64().ok()?;
+            owned_counts.push((category, count));
+        }
+    }
+
+    let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+    let category_col_idx = col_refs.iter().position(|&c| c == "category");
+    let borrowed_fields: Vec<forem_core::reactions::ReactionFieldValue<'_>> = owned_fields
+        .iter()
+        .map(OwnedReactionField::as_borrowed)
+        .collect();
+    let count_refs: Vec<forem_core::reactions::ArticleReactionCount<'_>> = owned_counts
+        .iter()
+        .map(|(cat, count)| forem_core::reactions::ArticleReactionCount {
+            category: cat.as_str(),
+            count: *count,
+        })
+        .collect();
+
+    let json = forem_core::reactions::serialize_article_reactions_json(
+        uid,
+        &col_refs,
+        category_col_idx,
+        &borrowed_fields,
+        &count_refs,
+    )?;
+    Some(ruby.str_new(&json))
+}
+
+fn serialize_comment_reactions_json(
+    ruby: &Ruby,
+    user_id: Value,
+    column_names: RArray,
+    reactions: RArray,
+    comment_rows: RArray,
+) -> Option<RString> {
+    let uid = extract_optional_user_id(user_id)?;
+    let cols = extract_column_names(ruby, column_names)?;
+    let owned_fields = extract_reaction_rows(ruby, column_names, reactions)?;
+
+    let count_len = comment_rows.len();
+    let sym_id = ruby.to_symbol("id");
+    let sym_count = ruby.to_symbol("count");
+
+    let mut counts = Vec::with_capacity(count_len);
+    for idx in 0..count_len {
+        let entry_val: Value = comment_rows.entry(idx as isize).ok()?;
+        if let Some(arr) = RArray::from_value(entry_val) {
+            if arr.len() != 2 {
+                return None;
+            }
+            let id_val: Value = arr.entry(0).ok()?;
+            let cnt_val: Value = arr.entry(1).ok()?;
+            let id = Integer::from_value(id_val)?.to_i64().ok()?;
+            let count = Integer::from_value(cnt_val)?.to_i64().ok()?;
+            counts.push(forem_core::reactions::CommentReactionCount { id, count });
+        } else {
+            let hash = RHash::from_value(entry_val)?;
+            if hash.len() != 2 {
+                return None;
+            }
+            let id_val = hash.get(sym_id).or_else(|| hash.get(ruby.str_new("id")))?;
+            let id = Integer::from_value(id_val)?.to_i64().ok()?;
+            let cnt_val = hash
+                .get(sym_count)
+                .or_else(|| hash.get(ruby.str_new("count")))?;
+            let count = Integer::from_value(cnt_val)?.to_i64().ok()?;
+            counts.push(forem_core::reactions::CommentReactionCount { id, count });
+        }
+    }
+
+    let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+    let borrowed_fields: Vec<forem_core::reactions::ReactionFieldValue<'_>> = owned_fields
+        .iter()
+        .map(OwnedReactionField::as_borrowed)
+        .collect();
+
+    let json = forem_core::reactions::serialize_comment_reactions_json(
+        uid,
+        &col_refs,
+        &borrowed_fields,
+        &counts,
+    )?;
+    Some(ruby.str_new(&json))
+}
+
+fn format_joined_at_date(ruby: &Ruby, epoch_secs: i64) -> Option<RString> {
+    let formatted = forem_core::api_users::format_joined_at_date(epoch_secs)?;
+    Some(ruby.str_new(&formatted))
+}
+
+unsafe fn parse_api_user_row(chunk: &[Value]) -> Option<forem_core::api_users::ApiUserRow<'_>> {
+    if chunk.len() != 10 {
+        return None;
+    }
+    let id = Integer::from_value(chunk[0])?.to_i64().ok()?;
+    let created_at_sec = Integer::from_value(chunk[8])?.to_i64().ok()?;
+    Some(forem_core::api_users::ApiUserRow {
+        id,
+        username: borrow_opt_utf8_str(chunk[1])?,
+        name: borrow_opt_utf8_str(chunk[2])?,
+        twitter_username: borrow_opt_utf8_str(chunk[3])?,
+        github_username: borrow_opt_utf8_str(chunk[4])?,
+        summary: borrow_opt_utf8_str(chunk[5])?,
+        location: borrow_opt_utf8_str(chunk[6])?,
+        website_url: borrow_opt_utf8_str(chunk[7])?,
+        created_at_sec,
+        profile_image: borrow_opt_utf8_str(chunk[9])?,
+    })
+}
+
+fn serialize_api_user_json(
+    ruby: &Ruby,
+    user_fields: RArray,
+    extended: bool,
+    email: Value,
+    badge_ids: Value,
+    followers_count: Value,
+) -> Option<RString> {
+    let followers = extract_opt_i64_val(followers_count)?;
+    let badges = if extended {
+        if badge_ids.is_nil() {
+            Vec::new()
+        } else {
+            extract_strict_i64_vec(RArray::from_value(badge_ids)?)?
+        }
+    } else {
+        Vec::new()
+    };
+
+    let json = {
+        // SAFETY: Zero-copy borrows of `user_fields` and `email` strings; `forem_core`
+        // never calls into Ruby, and all borrows end before `ruby.str_new` allocates.
+        let slice = unsafe { user_fields.as_slice() };
+        let row = unsafe { parse_api_user_row(slice) }?;
+        let email_str = if extended {
+            unsafe { borrow_opt_utf8_str(email) }?
+        } else {
+            None
+        };
+        forem_core::api_users::serialize_api_user_json(
+            &row, extended, email_str, &badges, followers,
+        )?
+    };
+    Some(ruby.str_new(&json))
+}
+
+fn serialize_api_users_json(ruby: &Ruby, users_flat: RArray) -> Option<RString> {
+    let json = {
+        // SAFETY: Zero-copy borrows of `users_flat` elements; `forem_core` never calls into
+        // Ruby, and all borrows end before `ruby.str_new` allocates.
+        let slice = unsafe { users_flat.as_slice() };
+        if slice.len() % 10 != 0 {
+            return None;
+        }
+        let mut rows = Vec::with_capacity(slice.len() / 10);
+        for chunk in slice.chunks_exact(10) {
+            rows.push(unsafe { parse_api_user_row(chunk) }?);
+        }
+        forem_core::api_users::serialize_api_users_json(&rows)?
+    };
+    Some(ruby.str_new(&json))
+}
+
+fn serialize_api_organization_json(ruby: &Ruby, org_fields: RArray) -> Option<RString> {
+    let json = {
+        // SAFETY: Zero-copy borrows of `org_fields` elements; `forem_core` never calls into
+        // Ruby, and all borrows end before `ruby.str_new` allocates.
+        let slice = unsafe { org_fields.as_slice() };
+        if slice.len() != 13 {
+            return None;
+        }
+        let id = Integer::from_value(slice[0])?.to_i64().ok()?;
+        let created_at_sec = extract_opt_i64_val(slice[11])?;
+        let org = forem_core::api_users::ApiOrganizationRow {
+            id,
+            username: unsafe { borrow_opt_utf8_str(slice[1]) }?,
+            name: unsafe { borrow_opt_utf8_str(slice[2]) }?,
+            summary: unsafe { borrow_opt_utf8_str(slice[3]) }?,
+            twitter_username: unsafe { borrow_opt_utf8_str(slice[4]) }?,
+            github_username: unsafe { borrow_opt_utf8_str(slice[5]) }?,
+            url: unsafe { borrow_opt_utf8_str(slice[6]) }?,
+            location: unsafe { borrow_opt_utf8_str(slice[7]) }?,
+            tech_stack: unsafe { borrow_opt_utf8_str(slice[8]) }?,
+            tag_line: unsafe { borrow_opt_utf8_str(slice[9]) }?,
+            story: unsafe { borrow_opt_utf8_str(slice[10]) }?,
+            created_at_sec,
+            profile_image: unsafe { borrow_opt_utf8_str(slice[12]) }?,
+        };
+        forem_core::api_users::serialize_api_organization_json(&org)?
+    };
     Some(ruby.str_new(&json))
 }
 
@@ -6416,6 +7766,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native_mod.define_singleton_method("json_quote", function!(json_quote, 2))?;
     native_mod.define_singleton_method("encode_json", function!(encode_json, 2))?;
     native_mod.define_singleton_method("json_encoded_size", function!(json_encoded_size, 2))?;
+    native_mod.define_singleton_method(
+        "validate_agent_session_data",
+        function!(validate_agent_session_data, 5),
+    )?;
     native_mod.define_singleton_method(
         "truncate_feed_xml_items",
         function!(truncate_feed_xml_items, 2),
@@ -6694,6 +8048,53 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native_mod.define_singleton_method(
         "serialize_api_articles_json",
         function!(serialize_api_articles_json, 6),
+    )?;
+    native_mod.define_singleton_method(
+        "format_utc_iso8601_millis",
+        function!(format_utc_iso8601_millis, 2),
+    )?;
+    native_mod.define_singleton_method(
+        "serialize_api_article_show_json",
+        function!(serialize_api_article_show_json, 8),
+    )?;
+    native_mod.define_singleton_method(
+        "serialize_api_articles_search_json",
+        function!(serialize_api_articles_search_json, 8),
+    )?;
+    native_mod.define_singleton_method(
+        "serialize_api_articles_me_json",
+        function!(serialize_api_articles_me_json, 6),
+    )?;
+    native_mod.define_singleton_method(
+        "select_top_public_reaction_categories",
+        function!(select_top_public_reaction_categories, 2),
+    )?;
+    native_mod.define_singleton_method(
+        "serialize_homepage_articles_json",
+        function!(serialize_homepage_articles_json, 8),
+    )?;
+    native_mod.define_singleton_method("format_json_float", function!(format_json_float, 1))?;
+    native_mod.define_singleton_method(
+        "serialize_article_reactions_json",
+        function!(serialize_article_reactions_json, 4),
+    )?;
+    native_mod.define_singleton_method(
+        "serialize_comment_reactions_json",
+        function!(serialize_comment_reactions_json, 4),
+    )?;
+    native_mod
+        .define_singleton_method("format_joined_at_date", function!(format_joined_at_date, 1))?;
+    native_mod.define_singleton_method(
+        "serialize_api_user_json",
+        function!(serialize_api_user_json, 5),
+    )?;
+    native_mod.define_singleton_method(
+        "serialize_api_users_json",
+        function!(serialize_api_users_json, 1),
+    )?;
+    native_mod.define_singleton_method(
+        "serialize_api_organization_json",
+        function!(serialize_api_organization_json, 1),
     )?;
     Ok(())
 }
